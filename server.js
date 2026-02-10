@@ -5,45 +5,84 @@ const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 require('dotenv').config();
 
+// --- MODELS ---
 const User = require('./models/User');
-const Snippet = require('./models/Snippet');
-const Project = require('./models/Project'); // Import Project Model
+const Project = require('./models/Project'); 
 const { sendOTPEmail } = require('./utils/sendEmail');
 
 const app = express();
-app.use(express.json());
-app.use(cors());
 
-// --- ROUTES CONNECTION ---
-// Connecting the external snippets route file for versioning and comments
-app.use('/snippets', require('./routes/snippets'));
+// --- MIDDLEWARE ---
+app.use(express.json());
+app.use(cors({
+    origin: '*', 
+    methods: ['GET', 'POST', 'PUT', 'DELETE'],
+    allowedHeaders: ['Content-Type', 'Authorization']
+}));
+
+// --- DATABASE CONNECTION ---
+// Set strictQuery to suppress global warnings
+mongoose.set('strictQuery', false);
 
 mongoose.connect(process.env.MONGO_URI)
     .then(() => console.log("Connected to MongoDB Cloud 🚀"))
-    .catch(err => console.log("DB Connection Error:", err));
+    .catch(err => console.error("DB Connection Error:", err));
 
 // --- AUTH ROUTES ---
 
 // 1. Register & Send OTP
 app.post('/register', async (req, res) => {
+    console.log("--- New Registration Request Received ---");
     try {
         const { name, email, password } = req.body;
+
+        if (!name || !email || !password) {
+            return res.status(400).json({ message: "All fields are required!" });
+        }
+
         const hashedPassword = await bcrypt.hash(password, 10);
-        
-        // Generate a 6-digit OTP
         const otp = Math.floor(100000 + Math.random() * 900000).toString();
 
-        // Update or Create user with OTP
+        console.log("Step 1: Updating User in Database...");
+        
+        /**
+         * FIX: We use returnDocument: 'after' and COMPLETELY REMOVED { new: true }
+         * This ensures the deprecation warning you saw disappears.
+         */
         await User.findOneAndUpdate(
             { email }, 
             { name, email, password: hashedPassword, otp, isVerified: false },
-            { upsert: true, new: true }
+            { upsert: true, returnDocument: 'after' } 
         );
+        console.log("Step 1 Complete: DB Updated ✅");
 
-        await sendOTPEmail(email, otp);
+        console.log(`Step 2: Triggering Email Service for: ${email}`);
+        
+        // Critical: Sub-catch block to pinpoint exactly why the email fails
+        try {
+            await sendOTPEmail(email, otp);
+            console.log("Step 2 Complete: Email Sent successfully 🚀");
+        } catch (emailError) {
+            console.error("EMAIL SERVICE FAILED:", emailError.message);
+            // This stops the process and tells you if it's an App Password issue
+            return res.status(500).json({ 
+                message: "Email service failed. Check Gmail credentials.", 
+                error: emailError.message 
+            });
+        }
+        
         res.status(201).json({ message: "OTP sent to your email!" });
+
     } catch (err) {
-        res.status(500).json({ message: "Registration failed!" });
+        console.error("!!!!!!!! REGISTER ROUTE CRASHED !!!!!!!! ");
+        console.error("Error Message:", err.message);
+        console.error("Full Stack Trace:", err.stack); 
+        console.log("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+
+        res.status(500).json({ 
+            message: "Registration failed on server!", 
+            error: err.message 
+        });
     }
 });
 
@@ -56,16 +95,16 @@ app.post('/verify-otp', async (req, res) => {
         if (!user) return res.status(400).json({ message: "Invalid OTP code!" });
 
         user.isVerified = true;
-        user.otp = null; // Clear OTP after success
+        user.otp = null; 
         await user.save();
 
         res.json({ message: "Account verified successfully!" });
     } catch (err) {
-        res.status(500).json({ message: "Verification error" });
+        res.status(500).json({ message: "Verification error", error: err.message });
     }
 });
 
-// 3. Login
+// 3. Login Route
 app.post('/login', async (req, res) => {
     try {
         const { email, password } = req.body;
@@ -78,104 +117,22 @@ app.post('/login', async (req, res) => {
         const isMatch = await bcrypt.compare(password, user.password);
         if (!isMatch) return res.status(400).json({ message: "Invalid credentials!" });
 
-        // Included user name in payload for easier comment handling in routes
-        const token = jwt.sign({ id: user._id, name: user.name }, process.env.JWT_SECRET);
+        if (!process.env.JWT_SECRET) {
+            throw new Error("JWT_SECRET is missing in environment variables!");
+        }
+
+        const token = jwt.sign(
+            { id: user._id, name: user.name }, 
+            process.env.JWT_SECRET,
+            { expiresIn: '1d' }
+        );
+        
         res.json({ token, user: { name: user.name, email: user.email } });
     } catch (err) {
-        res.status(500).json({ message: "Login error" });
+        res.status(500).json({ message: "Login error", error: err.message });
     }
 });
 
-// --- PROJECT MANAGEMENT ROUTES ---
-
-// 1. Create a new project
-app.post('/projects', async (req, res) => {
-    try {
-        const token = req.headers['authorization'];
-        const decoded = jwt.verify(token, process.env.JWT_SECRET);
-        const { projectName, description } = req.body;
-        
-        const newProject = new Project({
-            projectName,
-            description,
-            owner: decoded.id,
-            members: [],
-            pendingMembers: [] 
-        });
-        await newProject.save();
-        res.status(201).json(newProject);
-    } catch (err) { res.status(500).json({ message: "Error creating project" }); }
-});
-
-// 2. Get all projects (Where user is owner or an accepted member)
-app.get('/projects', async (req, res) => {
-    try {
-        const token = req.headers['authorization'];
-        const decoded = jwt.verify(token, process.env.JWT_SECRET);
-        const user = await User.findById(decoded.id);
-
-        const projects = await Project.find({
-            $or: [ { owner: decoded.id }, { members: user.email } ]
-        });
-        res.json(projects);
-    } catch (err) { res.status(500).json({ message: "Error fetching projects" }); }
-});
-
-// 3. Invite a member (Add to pendingMembers list)
-app.post('/projects/:id/invite', async (req, res) => {
-    try {
-        const token = req.headers['authorization'];
-        jwt.verify(token, process.env.JWT_SECRET);
-        
-        const { email } = req.body;
-        const project = await Project.findById(req.params.id);
-        
-        if (!project) return res.status(404).json({ message: "Project not found" });
-
-        // Add to pending only if not already a member or already invited
-        if (!project.members.includes(email) && !project.pendingMembers.includes(email)) {
-            project.pendingMembers.push(email);
-            await project.save();
-        }
-        res.json({ message: "Invitation sent!" });
-    } catch (err) { res.status(500).json({ message: "Error inviting member" }); }
-});
-
-// 4. Get Invitations for the logged-in user
-app.get('/my-invitations', async (req, res) => {
-    try {
-        const token = req.headers['authorization'];
-        const decoded = jwt.verify(token, process.env.JWT_SECRET);
-        const user = await User.findById(decoded.id);
-
-        // Find projects where the user's email is in the pending list
-        const invitations = await Project.find({ pendingMembers: user.email });
-        res.json(invitations);
-    } catch (err) { res.status(500).json({ message: "Error fetching invitations" }); }
-});
-
-// 5. Accept Invitation
-app.post('/projects/:id/accept', async (req, res) => {
-    try {
-        const token = req.headers['authorization'];
-        const decoded = jwt.verify(token, process.env.JWT_SECRET);
-        const user = await User.findById(decoded.id);
-
-        const project = await Project.findById(req.params.id);
-        if (!project) return res.status(404).json({ message: "Project not found" });
-
-        // Move email from pendingMembers to members
-        project.pendingMembers = project.pendingMembers.filter(e => e !== user.email);
-        if (!project.members.includes(user.email)) {
-            project.members.push(user.email);
-        }
-        await project.save();
-        
-        res.json({ message: "Invitation accepted!" });
-    } catch (err) { res.status(500).json(err); }
-});
-
-// Starting the server on port 5000
-app.listen(5000, () => console.log("Server running on port 5000"));
-
-
+// --- SERVER START ---
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
